@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="utf-8">
+    <title>Immich Backup</title>
+
+    <link href="../base1/cockpit.css" rel="stylesheet">
+    <script src="../base1/cockpit.js"></script>
+
+    <link href="style.css" rel="stylesheet">
+</head>
+
+<body>
+    <main class="page">
+        <header class="hero">
+            <div>
+                <p class="eyebrow">Cockpit extension</p>
+                <h1>Immich Backup</h1>
+                <p class="subtitle">
+                    Mirror folderu ze zdjęciami na zewnętrzny dysk backupowy.
+                </p>
+            </div>
+
+            <div class="hero-actions">
+                <button id="refreshBtn" class="button secondary">Odśwież dyski</button>
+            </div>
+        </header>
+
+        <section class="card">
+            <div class="section-header">
+                <div>
+                    <h2>Konfiguracja</h2>
+                    <p>Podaj folder źródłowy oraz nazwę folderu na dysku backupowym.</p>
+                </div>
+            </div>
+
+            <div class="form-grid">
+                <label>
+                    Folder źródłowy
+                    <input id="sourcePath" type="text" value="/home/kuczis/Pulpit/photos">
+                </label>
+
+                <label>
+                    Folder backupu na dysku
+                    <input id="backupDirName" type="text" value="ImmichBackup">
+                </label>
+            </div>
+
+            <p class="hint">
+                Dla Twojego folderu ze zdjęciami prawdopodobna ścieżka to:
+                <code>/home/kuczis/Pulpit/photos</code>
+            </p>
+        </section>
+
+        <section class="card">
+            <div class="section-header">
+                <div>
+                    <h2>Dyski</h2>
+                    <p>Wybierz zamontowany dysk, na który ma zostać wykonany backup.</p>
+                </div>
+            </div>
+
+            <div id="diskList" class="disk-list">
+                <div class="empty">Ładowanie dysków...</div>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="section-header">
+                <div>
+                    <h2>Status backupu</h2>
+                    <p>Status jest wspólny dla wszystkich komputerów otwierających ten panel.</p>
+                </div>
+            </div>
+
+            <div class="status-panel">
+                <div>
+                    <span id="statusBadge" class="badge idle">Bezczynny</span>
+                </div>
+
+                <div id="statusMessage" class="status-message">
+                    Brak aktywnego backupu.
+                </div>
+            </div>
+
+            <div class="selected-disk">
+                <strong>Wybrany dysk:</strong>
+                <span id="selectedDiskText">Nie wybrano</span>
+            </div>
+
+            <div class="progress-wrap">
+                <div id="progressBar" class="progress-bar"></div>
+            </div>
+
+            <div class="progress-meta">
+                <span id="progressText">0%</span>
+                <span id="speedText">—</span>
+                <span id="etaText">—</span>
+            </div>
+
+            <div class="actions">
+                <button id="startBtn" class="button primary" disabled>Start backup</button>
+                <button id="resumeBtn" class="button warning" disabled>Wznów backup</button>
+                <button id="stopBtn" class="button danger" disabled>Stop</button>
+            </div>
+
+            <pre id="logBox"></pre>
+        </section>
+
+        <section class="card notice">
+            <h2>Ważne</h2>
+            <p>
+                Ten system robi mirror. To znaczy, że pliki usunięte ze źródła
+                zostaną usunięte również z kopii przy następnym backupie.
+            </p>
+            <p>
+                Jeżeli dysk zostanie odłączony w trakcie kopiowania, backup zostanie
+                oznaczony jako wstrzymany. Po ponownym podłączeniu dysku kliknij
+                <strong>Wznów backup</strong>.
+            </p>
+            <p>
+                Przed fizycznym odłączeniem dysku użyj przycisku
+                <strong>Odmontuj</strong>.
+            </p>
+        </section>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
