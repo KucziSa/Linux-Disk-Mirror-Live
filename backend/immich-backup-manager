@@ -1,0 +1,687 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import json
+import os
+import re
+import select
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+STATE_DIR = Path("/var/lib/immich-backup")
+STATE_FILE = STATE_DIR / "state.json"
+LOG_FILE = STATE_DIR / "backup.log"
+PID_FILE = STATE_DIR / "backup.pid"
+METADATA_FILE = ".immich-backup.json"
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def fix_file_permissions(path):
+    try:
+        st = STATE_DIR.stat()
+        os.chown(path, st.st_uid, st.st_gid)
+    except Exception:
+        pass
+
+    try:
+        os.chmod(path, 0o664)
+    except Exception:
+        pass
+
+
+def read_json(path, default):
+    try:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return default
+
+
+def write_json_atomic(path, data):
+    ensure_state_dir()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    fix_file_permissions(path)
+
+
+def append_log(text):
+    ensure_state_dir()
+    with LOG_FILE.open("a", encoding="utf-8") as f:
+        f.write(text)
+    fix_file_permissions(LOG_FILE)
+
+
+def tail_log(max_bytes=12000):
+    if not LOG_FILE.exists():
+        return ""
+
+    with LOG_FILE.open("rb") as f:
+        try:
+            f.seek(-max_bytes, os.SEEK_END)
+        except OSError:
+            f.seek(0)
+        return f.read().decode("utf-8", errors="replace")
+
+
+def update_state(**kwargs):
+    state = read_json(STATE_FILE, {})
+    state.update(kwargs)
+    state["updated_at"] = now_iso()
+    state["last_log"] = tail_log()
+    write_json_atomic(STATE_FILE, state)
+
+
+def process_alive(pid):
+    if not pid:
+        return False
+
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+
+
+def kill_process_group(pid):
+    try:
+        os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
+        time.sleep(1)
+        if process_alive(pid):
+            os.killpg(os.getpgid(int(pid)), signal.SIGKILL)
+    except Exception:
+        pass
+
+
+def run_command(args):
+    result = subprocess.run(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+
+    return result.stdout
+
+
+def exact_mount_info(path):
+    target = str(Path(path).resolve())
+
+    result = subprocess.run(
+        ["findmnt", "-n", "-T", target, "-o", "TARGET,SOURCE"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False
+    )
+
+    if result.returncode != 0:
+        return None
+
+    line = result.stdout.strip()
+    if not line:
+        return None
+
+    parts = line.split(None, 1)
+    mount_target = parts[0]
+    source = parts[1] if len(parts) > 1 else None
+
+    if str(Path(mount_target).resolve()) != target:
+        return None
+
+    return {
+        "target": mount_target,
+        "source": source
+    }
+
+
+def is_exact_mount(path):
+    return exact_mount_info(path) is not None
+
+
+def get_mount_source(path):
+    info = exact_mount_info(path)
+    if not info:
+        return None
+    return info.get("source")
+
+
+def list_disks():
+    output = run_command([
+        "lsblk",
+        "-J",
+        "-o",
+        "NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINT,MODEL,TRAN"
+    ])
+
+    data = json.loads(output)
+    disks = []
+
+    ignored_mounts = {
+        "/",
+        "/boot",
+        "/boot/efi",
+        "/home",
+        "/var"
+    }
+
+    def walk(device, parent_model=None, parent_tran=None):
+        model = device.get("model") or parent_model
+        tran = device.get("tran") or parent_tran
+        mountpoint = device.get("mountpoint")
+        fstype = device.get("fstype")
+
+        if device.get("type") in ("part", "disk") and mountpoint:
+            if mountpoint not in ignored_mounts and not mountpoint.startswith("/snap"):
+                metadata_path = Path(mountpoint) / METADATA_FILE
+
+                disks.append({
+                    "name": device.get("name"),
+                    "path": device.get("path"),
+                    "size": device.get("size"),
+                    "type": device.get("type"),
+                    "fstype": fstype,
+                    "label": device.get("label"),
+                    "uuid": device.get("uuid"),
+                    "mountpoint": mountpoint,
+                    "model": model,
+                    "tran": tran,
+                    "has_metadata": metadata_path.exists(),
+                    "metadata_path": str(metadata_path) if metadata_path.exists() else None
+                })
+
+        for child in device.get("children") or []:
+            walk(child, model, tran)
+
+    for blockdevice in data.get("blockdevices", []):
+        walk(blockdevice)
+
+    return disks
+
+
+def command_disks(_args):
+    print(json.dumps({
+        "ok": True,
+        "disks": list_disks()
+    }, indent=2, ensure_ascii=False))
+
+
+def command_state(_args):
+    state = read_json(STATE_FILE, {
+        "status": "idle",
+        "progress": 0,
+        "message": "Brak aktywnego backupu."
+    })
+
+    if state.get("status") == "running":
+        pid = state.get("pid")
+        target = state.get("target")
+
+        if pid and not process_alive(pid):
+            update_state(
+                status="failed",
+                message="Proces backupu nie działa. Możesz spróbować wznowić backup.",
+                pid=None
+            )
+            state = read_json(STATE_FILE, state)
+
+        elif target and not is_exact_mount(target):
+            update_state(
+                status="paused",
+                disk_missing=True,
+                pid=None,
+                message="Dysk backupowy został odłączony albo odmontowany. Podłącz go ponownie i kliknij Wznów backup."
+            )
+            state = read_json(STATE_FILE, state)
+
+    state["last_log"] = tail_log()
+    print(json.dumps(state, indent=2, ensure_ascii=False))
+
+
+def write_metadata(target_path, source_path, backup_dir_name, status_text):
+    metadata = {
+        "app": "Immich Backup Cockpit Plugin",
+        "metadata_version": 1,
+        "status": status_text,
+        "hostname": socket.gethostname(),
+        "source_path": str(source_path),
+        "backup_dir_name": backup_dir_name,
+        "target_mountpoint": str(target_path),
+        "updated_at": now_iso()
+    }
+
+    metadata_path = Path(target_path) / METADATA_FILE
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+
+def validate_start(source, target):
+    source_path = Path(source).expanduser().resolve()
+    target_path = Path(target).expanduser().resolve()
+
+    if not source_path.exists():
+        raise RuntimeError(f"Folder źródłowy nie istnieje: {source_path}")
+
+    if not source_path.is_dir():
+        raise RuntimeError(f"Źródło nie jest folderem: {source_path}")
+
+    if not target_path.exists():
+        raise RuntimeError(f"Dysk docelowy nie istnieje: {target_path}")
+
+    if not target_path.is_dir():
+        raise RuntimeError(f"Cel nie jest folderem: {target_path}")
+
+    if not is_exact_mount(target_path):
+        raise RuntimeError(
+            f"Cel nie wygląda na osobno zamontowany dysk: {target_path}. "
+            f"Zamontuj dysk np. pod /mnt/dysk-backup."
+        )
+
+    return source_path, target_path
+
+
+def command_start(args):
+    state = read_json(STATE_FILE, {})
+
+    if state.get("status") == "running" and process_alive(state.get("pid")):
+        raise RuntimeError("Backup już trwa.")
+
+    source_path, target_path = validate_start(args.source, args.target)
+
+    ensure_state_dir()
+    LOG_FILE.write_text("", encoding="utf-8")
+    fix_file_permissions(LOG_FILE)
+
+    backup_root = target_path / args.backup_dir_name
+    backup_data = backup_root / "data"
+    backup_data.mkdir(parents=True, exist_ok=True)
+
+    mount_source = get_mount_source(target_path)
+
+    state = {
+        "status": "starting",
+        "progress": 0,
+        "source": str(source_path),
+        "target": str(target_path),
+        "target_mount_source": mount_source,
+        "backup_dir_name": args.backup_dir_name,
+        "backup_data": str(backup_data),
+        "disk_missing": False,
+        "message": "Uruchamianie backupu...",
+        "started_at": now_iso(),
+        "updated_at": now_iso(),
+        "speed": "—",
+        "eta": "—"
+    }
+
+    write_json_atomic(STATE_FILE, state)
+    write_metadata(target_path, source_path, args.backup_dir_name, "running")
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "_worker",
+        "--source", str(source_path),
+        "--target", str(target_path),
+        "--backup-dir-name", args.backup_dir_name
+    ]
+
+    with LOG_FILE.open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=log,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True
+        )
+
+    PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+    fix_file_permissions(PID_FILE)
+
+    update_state(
+        status="running",
+        pid=proc.pid,
+        message="Backup działa w tle.",
+        progress=0
+    )
+
+    print(json.dumps({
+        "ok": True,
+        "pid": proc.pid,
+        "message": "Backup uruchomiony w tle."
+    }, indent=2, ensure_ascii=False))
+
+
+def command_resume(_args):
+    state = read_json(STATE_FILE, {})
+
+    source = state.get("source")
+    target = state.get("target")
+    backup_dir_name = state.get("backup_dir_name", "ImmichBackup")
+
+    if not source or not target:
+        raise RuntimeError("Brak poprzedniego backupu do wznowienia.")
+
+    if state.get("status") == "running" and process_alive(state.get("pid")):
+        raise RuntimeError("Backup już trwa.")
+
+    source_path, target_path = validate_start(source, target)
+
+    previous_source = state.get("target_mount_source")
+    current_source = get_mount_source(target_path)
+
+    if previous_source and current_source and previous_source != current_source:
+        raise RuntimeError(
+            "Pod tą samą ścieżką jest zamontowany inny dysk niż wcześniej. "
+            "Dla bezpieczeństwa wybierz dysk ręcznie i uruchom Start backup."
+        )
+
+    class ResumeArgs:
+        pass
+
+    args = ResumeArgs()
+    args.source = str(source_path)
+    args.target = str(target_path)
+    args.backup_dir_name = backup_dir_name
+
+    command_start(args)
+
+
+def command_stop(_args):
+    state = read_json(STATE_FILE, {})
+    pid = state.get("pid")
+
+    if pid and process_alive(pid):
+        kill_process_group(pid)
+
+    update_state(
+        status="stopped",
+        pid=None,
+        message="Backup został zatrzymany przez użytkownika.",
+        disk_missing=False
+    )
+
+    print(json.dumps({
+        "ok": True,
+        "message": "Backup zatrzymany."
+    }, indent=2, ensure_ascii=False))
+
+
+def command_unmount(args):
+    target_path = Path(args.target).expanduser().resolve()
+    state = read_json(STATE_FILE, {})
+
+    if state.get("status") == "running" and process_alive(state.get("pid")):
+        raise RuntimeError("Nie można odmontować dysku, gdy backup trwa. Najpierw kliknij Stop.")
+
+    if not target_path.exists():
+        raise RuntimeError(f"Ścieżka nie istnieje: {target_path}")
+
+    if not is_exact_mount(target_path):
+        raise RuntimeError(f"Ten folder nie jest aktualnie punktem montowania dysku: {target_path}")
+
+    result = subprocess.run(
+        ["umount", str(target_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Nie udało się odmontować dysku.")
+
+    update_state(
+        message=f"Dysk został odmontowany: {target_path}",
+        disk_missing=True
+    )
+
+    print(json.dumps({
+        "ok": True,
+        "message": f"Dysk został odmontowany: {target_path}"
+    }, indent=2, ensure_ascii=False))
+
+
+def parse_progress(line):
+    percent = None
+    speed = None
+    eta = None
+
+    percent_match = re.search(r"(\d+)%", line)
+    if percent_match:
+        percent = int(percent_match.group(1))
+
+    speed_match = re.search(r"([0-9.,]+[KMGT]?B/s)", line)
+    if speed_match:
+        speed = speed_match.group(1)
+
+    eta_match = re.search(r"(\d+:\d+:\d+)", line)
+    if eta_match:
+        eta = "ETA " + eta_match.group(1)
+
+    return percent, speed, eta
+
+
+def handle_progress_line(line):
+    if not line:
+        return
+
+    append_log(line + "\n")
+
+    percent, speed, eta = parse_progress(line)
+
+    updates = {
+        "status": "running",
+        "message": "Backup trwa.",
+        "disk_missing": False,
+        "pid": os.getpid()
+    }
+
+    if percent is not None:
+        updates["progress"] = percent
+    if speed is not None:
+        updates["speed"] = speed
+    if eta is not None:
+        updates["eta"] = eta
+
+    update_state(**updates)
+
+
+def worker(args):
+    source_path, target_path = validate_start(args.source, args.target)
+
+    backup_root = target_path / args.backup_dir_name
+    backup_data = backup_root / "data"
+    backup_data.mkdir(parents=True, exist_ok=True)
+
+    source_arg = str(source_path) + "/"
+    target_arg = str(backup_data) + "/"
+
+    # Używamy -rt zamiast -aH, bo Twój dysk backupowy jest exFAT.
+    # exFAT nie wspiera normalnie linuxowych właścicieli, grup i uprawnień.
+    rsync_cmd = [
+        "rsync",
+        "-rt",
+        "--delete",
+        "--partial",
+        "--append-verify",
+        "--info=progress2",
+        "--human-readable",
+        source_arg,
+        target_arg
+    ]
+
+    append_log("Start backupu\n")
+    append_log(f"Źródło: {source_path}\n")
+    append_log(f"Cel: {backup_data}\n")
+    append_log("Komenda: " + " ".join(rsync_cmd) + "\n\n")
+
+    update_state(
+        status="running",
+        progress=0,
+        message="Backup trwa.",
+        disk_missing=False,
+        pid=os.getpid()
+    )
+
+    process = subprocess.Popen(
+        rsync_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=0,
+        start_new_session=True
+    )
+
+    buffer = ""
+    last_mount_check = 0
+
+    try:
+        while True:
+            if time.time() - last_mount_check > 2:
+                last_mount_check = time.time()
+
+                if not is_exact_mount(target_path):
+                    append_log("\nDysk został odłączony albo odmontowany. Wstrzymuję backup.\n")
+                    kill_process_group(process.pid)
+
+                    update_state(
+                        status="paused",
+                        pid=None,
+                        disk_missing=True,
+                        message="Dysk backupowy został odłączony. Podłącz go ponownie i kliknij Wznów backup."
+                    )
+                    return 20
+
+            if process.poll() is not None:
+                remaining = process.stdout.read() if process.stdout else ""
+                if remaining:
+                    buffer += remaining
+                break
+
+            ready, _, _ = select.select([process.stdout], [], [], 1)
+
+            if ready:
+                char = process.stdout.read(1)
+
+                if char == "":
+                    continue
+
+                if char in ("\n", "\r"):
+                    line = buffer.strip()
+                    buffer = ""
+                    if line:
+                        handle_progress_line(line)
+                else:
+                    buffer += char
+
+        if buffer.strip():
+            handle_progress_line(buffer.strip())
+
+        returncode = process.wait()
+
+        if returncode == 0:
+            append_log("\nBackup zakończony poprawnie.\n")
+            write_metadata(target_path, source_path, args.backup_dir_name, "completed")
+            update_state(
+                status="completed",
+                progress=100,
+                pid=None,
+                disk_missing=False,
+                message="Backup zakończony poprawnie.",
+                speed="—",
+                eta="—",
+                completed_at=now_iso()
+            )
+            return 0
+
+        append_log(f"\nRsync zakończył się kodem: {returncode}\n")
+        update_state(
+            status="failed",
+            pid=None,
+            message=f"Backup zakończony błędem rsync: {returncode}. Możesz spróbować wznowić backup."
+        )
+        return returncode
+
+    except Exception as exc:
+        append_log(f"\nBłąd workera: {exc}\n")
+        update_state(
+            status="failed",
+            pid=None,
+            message=f"Błąd backupu: {exc}"
+        )
+        return 1
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Immich Backup Manager")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    p_disks = subparsers.add_parser("disks")
+    p_disks.set_defaults(func=command_disks)
+
+    p_state = subparsers.add_parser("state")
+    p_state.set_defaults(func=command_state)
+
+    p_start = subparsers.add_parser("start")
+    p_start.add_argument("--source", required=True)
+    p_start.add_argument("--target", required=True)
+    p_start.add_argument("--backup-dir-name", default="ImmichBackup")
+    p_start.set_defaults(func=command_start)
+
+    p_resume = subparsers.add_parser("resume")
+    p_resume.set_defaults(func=command_resume)
+
+    p_stop = subparsers.add_parser("stop")
+    p_stop.set_defaults(func=command_stop)
+
+    p_unmount = subparsers.add_parser("unmount")
+    p_unmount.add_argument("--target", required=True)
+    p_unmount.set_defaults(func=command_unmount)
+
+    p_worker = subparsers.add_parser("_worker")
+    p_worker.add_argument("--source", required=True)
+    p_worker.add_argument("--target", required=True)
+    p_worker.add_argument("--backup-dir-name", default="ImmichBackup")
+    p_worker.set_defaults(func=worker)
+
+    return parser
+
+
+def main():
+    ensure_state_dir()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        result = args.func(args)
+        if isinstance(result, int):
+            sys.exit(result)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
